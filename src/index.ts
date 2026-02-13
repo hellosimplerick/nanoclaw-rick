@@ -1,4 +1,3 @@
-import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -38,6 +37,7 @@ import { formatMessages, formatOutbound } from './router.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
+import { AppleContainerRuntime } from './runtime/apple-container-runtime.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -47,6 +47,7 @@ let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
+const containerRuntime = new AppleContainerRuntime();
 
 let whatsapp: WhatsAppChannel;
 const queue = new GroupQueue();
@@ -393,12 +394,12 @@ function recoverPendingMessages(): void {
 
 function ensureContainerSystemRunning(): void {
   try {
-    execSync('container system status', { stdio: 'pipe' });
+    containerRuntime.systemStatus();
     logger.debug('Apple Container system already running');
   } catch {
     logger.info('Starting Apple Container system...');
     try {
-      execSync('container system start', { stdio: 'pipe', timeout: 30000 });
+      containerRuntime.systemStart(30000);
       logger.info('Apple Container system started');
     } catch (err) {
       logger.error({ err }, 'Failed to start Apple Container system');
@@ -432,17 +433,14 @@ function ensureContainerSystemRunning(): void {
 
   // Kill and clean up orphaned NanoClaw containers from previous runs
   try {
-    const output = execSync('container ls --format json', {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      encoding: 'utf-8',
-    });
+    const output = containerRuntime.listContainersJson();
     const containers: { status: string; configuration: { id: string } }[] = JSON.parse(output || '[]');
     const orphans = containers
       .filter((c) => c.status === 'running' && c.configuration.id.startsWith('nanoclaw-'))
       .map((c) => c.configuration.id);
     for (const name of orphans) {
       try {
-        execSync(`container stop ${name}`, { stdio: 'pipe' });
+        containerRuntime.stopContainerSync(name);
       } catch { /* already stopped */ }
     }
     if (orphans.length > 0) {

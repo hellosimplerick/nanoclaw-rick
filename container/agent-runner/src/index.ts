@@ -16,8 +16,9 @@
 
 import fs from 'fs';
 import path from 'path';
-import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
+import { HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
+import { AnthropicProvider } from './llm/anthropic-provider.js';
 
 interface ContainerInput {
   prompt: string;
@@ -56,6 +57,7 @@ interface SDKUserMessage {
 const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
+const llmProvider = new AnthropicProvider();
 
 /**
  * Push-based async iterable for streaming user messages to the SDK.
@@ -371,7 +373,7 @@ async function runQuery(
     globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
   }
 
-  for await (const message of query({
+  for await (const message of llmProvider.query({
     prompt: stream,
     options: {
       cwd: '/workspace/group',

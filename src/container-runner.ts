@@ -2,7 +2,7 @@
  * Container Runner for NanoClaw
  * Spawns agent execution in Apple Container and handles IPC
  */
-import { ChildProcess, exec, spawn } from 'child_process';
+import { ChildProcess } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -18,10 +18,12 @@ import {
 import { logger } from './logger.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
+import { AppleContainerRuntime } from './runtime/apple-container-runtime.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+const containerRuntime = new AppleContainerRuntime();
 
 function getHomeDir(): string {
   const home = process.env.HOME || os.homedir();
@@ -269,9 +271,14 @@ export async function runContainerAgent(
   fs.mkdirSync(logsDir, { recursive: true });
 
   return new Promise((resolve) => {
-    const container = spawn('container', containerArgs, {
+    const container = containerRuntime.spawnRun(containerArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
+    if (!container.stdin || !container.stdout || !container.stderr) {
+      throw new Error(
+        'Expected container process stdio streams to be available (pipe).',
+      );
+    }
 
     onProcess(container, containerName);
 
@@ -373,7 +380,7 @@ export async function runContainerAgent(
     const killOnTimeout = () => {
       timedOut = true;
       logger.error({ group: group.name, containerName }, 'Container timeout, stopping gracefully');
-      exec(`container stop ${containerName}`, { timeout: 15000 }, (err) => {
+      containerRuntime.stopContainerAsync(containerName, 15000, (err) => {
         if (err) {
           logger.warn({ group: group.name, containerName, err }, 'Graceful stop failed, force killing');
           container.kill('SIGKILL');
