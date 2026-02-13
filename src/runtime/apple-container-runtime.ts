@@ -1,6 +1,6 @@
 import { ChildProcess, exec, execSync, SpawnOptions, spawn } from 'child_process';
 
-import { ContainerRuntime } from './container-runtime.js';
+import type { ContainerRuntime } from './container-runtime.js';
 
 export class AppleContainerRuntime implements ContainerRuntime {
   systemStatus(): void {

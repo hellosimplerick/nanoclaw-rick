@@ -9,7 +9,7 @@ import {
   POLL_INTERVAL,
   TRIGGER_PATTERN,
 } from './config.js';
-import { WhatsAppChannel } from './channels/whatsapp.js';
+import { createChannel, AppChannel } from './channels/factory.js';
 import {
   ContainerOutput,
   runContainerAgent,
@@ -28,8 +28,11 @@ import {
   setRegisteredGroup,
   setRouterState,
   setSession,
+  markInboundReplyFailed,
+  markInboundReplySent,
   storeChatMetadata,
   storeMessage,
+  tryClaimInboundReply,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { startIpcWatcher } from './ipc.js';
@@ -37,7 +40,10 @@ import { formatMessages, formatOutbound } from './router.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
-import { AppleContainerRuntime } from './runtime/apple-container-runtime.js';
+import {
+  createContainerRuntime,
+  resolveContainerEngine,
+} from './runtime/container-runtime.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -47,9 +53,10 @@ let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
-const containerRuntime = new AppleContainerRuntime();
+const containerRuntime = createContainerRuntime();
+const containerEngine = resolveContainerEngine();
 
-let whatsapp: WhatsAppChannel;
+let channel: AppChannel;
 const queue = new GroupQueue();
 
 function loadState(): void {
@@ -77,6 +84,10 @@ function saveState(): void {
   );
 }
 
+async function dispatchOutboundMessage(chatJid: string, text: string): Promise<void> {
+  await channel.sendMessage(chatJid, text);
+}
+
 function registerGroup(jid: string, group: RegisteredGroup): void {
   registeredGroups[jid] = group;
   setRegisteredGroup(jid, group);
@@ -89,6 +100,30 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
     { jid, name: group.name, folder: group.folder },
     'Group registered',
   );
+}
+
+function ensureDevChannelGroup(): void {
+  if (channel.name !== 'dev') return;
+  if (registeredGroups['dev@local']) return;
+
+  const usedFolders = new Set(Object.values(registeredGroups).map((g) => g.folder));
+  let folder = MAIN_GROUP_FOLDER;
+  if (usedFolders.has(folder)) {
+    folder = 'dev';
+    let suffix = 1;
+    while (usedFolders.has(folder)) {
+      folder = `dev-${suffix}`;
+      suffix += 1;
+    }
+  }
+
+  registerGroup('dev@local', {
+    name: 'Dev Local',
+    folder,
+    trigger: `@${ASSISTANT_NAME}`,
+    added_at: new Date().toISOString(),
+    requiresTrigger: false,
+  });
 }
 
 /**
@@ -142,6 +177,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   }
 
   const prompt = formatMessages(missedMessages);
+  const deliveryInboundMessageIds = missedMessages.map((m) => m.id);
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
@@ -166,7 +202,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }, IDLE_TIMEOUT);
   };
 
-  await whatsapp.setTyping(chatJid, true);
+  if (channel.setTyping) await channel.setTyping(chatJid, true);
   let hadError = false;
   let outputSentToUser = false;
 
@@ -178,8 +214,18 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
       if (text) {
-        await whatsapp.sendMessage(chatJid, `${ASSISTANT_NAME}: ${text}`);
-        outputSentToUser = true;
+        for (const inboundMessageId of deliveryInboundMessageIds) {
+          if (!tryClaimInboundReply(inboundMessageId)) continue;
+          try {
+            await dispatchOutboundMessage(chatJid, `${ASSISTANT_NAME}: ${text}`);
+            markInboundReplySent(inboundMessageId);
+            outputSentToUser = true;
+          } catch (err) {
+            const errorMessage = err instanceof Error ? err.message : String(err);
+            markInboundReplyFailed(inboundMessageId, errorMessage);
+            throw err;
+          }
+        }
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
       resetIdleTimer();
@@ -190,7 +236,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
   });
 
-  await whatsapp.setTyping(chatJid, false);
+  if (channel.setTyping) await channel.setTyping(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError) {
@@ -342,29 +388,13 @@ async function startMessageLoop(): Promise<void> {
             if (!hasTrigger) continue;
           }
 
-          // Pull all messages since lastAgentTimestamp so non-trigger
-          // context that accumulated between triggers is included.
-          const allPending = getMessagesSince(
-            chatJid,
-            lastAgentTimestamp[chatJid] || '',
-            ASSISTANT_NAME,
-          );
-          const messagesToSend =
-            allPending.length > 0 ? allPending : groupMessages;
-          const formatted = formatMessages(messagesToSend);
-
-          if (queue.sendMessage(chatJid, formatted)) {
-            logger.debug(
-              { chatJid, count: messagesToSend.length },
-              'Piped messages to active container',
-            );
-            lastAgentTimestamp[chatJid] =
-              messagesToSend[messagesToSend.length - 1].timestamp;
-            saveState();
-          } else {
-            // No active container — enqueue for a new one
-            queue.enqueueMessageCheck(chatJid);
-          }
+          // Interactive follow-up injection into an active container is
+          // intentionally disabled until we have per-message correlation IDs
+          // for deterministic reply attribution.
+          // Force active sessions to wind down so pending inbound messages are
+          // picked up by a fresh standard processing run.
+          queue.closeStdin(chatJid);
+          queue.enqueueMessageCheck(chatJid);
         }
       }
     } catch (err) {
@@ -393,41 +423,84 @@ function recoverPendingMessages(): void {
 }
 
 function ensureContainerSystemRunning(): void {
-  try {
-    containerRuntime.systemStatus();
-    logger.debug('Apple Container system already running');
-  } catch {
-    logger.info('Starting Apple Container system...');
+  if (containerEngine === 'docker') {
     try {
-      containerRuntime.systemStart(30000);
-      logger.info('Apple Container system started');
+      containerRuntime.systemStatus();
+      logger.debug('Docker daemon is reachable');
     } catch (err) {
-      logger.error({ err }, 'Failed to start Apple Container system');
+      logger.error({ err }, 'Docker daemon not running');
       console.error(
         '\n╔════════════════════════════════════════════════════════════════╗',
       );
       console.error(
-        '║  FATAL: Apple Container system failed to start                 ║',
+        '║  FATAL: Docker daemon not running                              ║',
       );
       console.error(
         '║                                                                ║',
       );
       console.error(
-        '║  Agents cannot run without Apple Container. To fix:           ║',
+        '║  Docker daemon not running - ensure it is installed and       ║',
       );
       console.error(
-        '║  1. Install from: https://github.com/apple/container/releases ║',
+        '║  started.                                                      ║',
       );
       console.error(
-        '║  2. Run: container system start                               ║',
+        '║                                                                ║',
       );
       console.error(
-        '║  3. Restart NanoClaw                                          ║',
+        '║  Suggested checks:                                             ║',
+      );
+      console.error(
+        '║  1. Verify Docker is installed: docker --version              ║',
+      );
+      console.error(
+        '║  2. Start daemon: sudo systemctl start docker                 ║',
+      );
+      console.error(
+        '║  3. Retry: docker info                                        ║',
       );
       console.error(
         '╚════════════════════════════════════════════════════════════════╝\n',
       );
-      throw new Error('Apple Container system is required but failed to start');
+      throw new Error('Docker daemon not running — ensure it is installed and started.');
+    }
+  } else {
+    try {
+      containerRuntime.systemStatus();
+      logger.debug('Apple Container system already running');
+    } catch {
+      logger.info('Starting Apple Container system...');
+      try {
+        containerRuntime.systemStart(30000);
+        logger.info('Apple Container system started');
+      } catch (err) {
+        logger.error({ err }, 'Failed to start Apple Container system');
+        console.error(
+          '\n╔════════════════════════════════════════════════════════════════╗',
+        );
+        console.error(
+          '║  FATAL: Apple Container system failed to start                 ║',
+        );
+        console.error(
+          '║                                                                ║',
+        );
+        console.error(
+          '║  Agents cannot run without Apple Container. To fix:           ║',
+        );
+        console.error(
+          '║  1. Install from: https://github.com/apple/container/releases ║',
+        );
+        console.error(
+          '║  2. Run: container system start                               ║',
+        );
+        console.error(
+          '║  3. Restart NanoClaw                                          ║',
+        );
+        console.error(
+          '╚════════════════════════════════════════════════════════════════╝\n',
+        );
+        throw new Error('Apple Container system is required but failed to start');
+      }
     }
   }
 
@@ -452,6 +525,7 @@ function ensureContainerSystemRunning(): void {
 }
 
 async function main(): Promise<void> {
+  logger.info(`Container runtime selected: ${containerEngine}`);
   ensureContainerSystemRunning();
   initDatabase();
   logger.info('Database initialized');
@@ -461,21 +535,23 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
     await queue.shutdown(10000);
-    await whatsapp.disconnect();
+    await channel.disconnect();
     process.exit(0);
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
 
-  // Create WhatsApp channel
-  whatsapp = new WhatsAppChannel({
+  // Create selected channel (default: WhatsApp)
+  channel = await createChannel({
     onMessage: (chatJid, msg) => storeMessage(msg),
-    onChatMetadata: (chatJid, timestamp) => storeChatMetadata(chatJid, timestamp),
+    onChatMetadata: (chatJid, timestamp, name) =>
+      storeChatMetadata(chatJid, timestamp, name),
     registeredGroups: () => registeredGroups,
   });
+  ensureDevChannelGroup();
 
   // Connect — resolves when first connected
-  await whatsapp.connect();
+  await channel.connect();
 
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
@@ -484,15 +560,16 @@ async function main(): Promise<void> {
     queue,
     onProcess: (groupJid, proc, containerName, groupFolder) => queue.registerProcess(groupJid, proc, containerName, groupFolder),
     sendMessage: async (jid, rawText) => {
-      const text = formatOutbound(whatsapp, rawText);
-      if (text) await whatsapp.sendMessage(jid, text);
+      const text = formatOutbound(channel, rawText);
+      if (text) await dispatchOutboundMessage(jid, text);
     },
   });
   startIpcWatcher({
-    sendMessage: (jid, text) => whatsapp.sendMessage(jid, text),
+    sendMessage: (jid, text) => dispatchOutboundMessage(jid, text),
     registeredGroups: () => registeredGroups,
     registerGroup,
-    syncGroupMetadata: (force) => whatsapp.syncGroupMetadata(force),
+    syncGroupMetadata: (force) =>
+      channel.syncGroupMetadata ? channel.syncGroupMetadata(force) : Promise.resolve(),
     getAvailableGroups,
     writeGroupsSnapshot: (gf, im, ag, rj) => writeGroupsSnapshot(gf, im, ag, rj),
   });

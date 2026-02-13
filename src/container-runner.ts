@@ -17,13 +17,13 @@ import {
 } from './config.js';
 import { logger } from './logger.js';
 import { validateAdditionalMounts } from './mount-security.js';
+import { createContainerRuntime } from './runtime/container-runtime.js';
 import { RegisteredGroup } from './types.js';
-import { AppleContainerRuntime } from './runtime/apple-container-runtime.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
-const containerRuntime = new AppleContainerRuntime();
+const containerRuntime = createContainerRuntime();
 
 function getHomeDir(): string {
   const home = process.env.HOME || os.homedir();
@@ -163,27 +163,53 @@ function buildVolumeMounts(
   // Only expose specific auth variables needed by Claude Code, not the entire .env
   const envDir = path.join(DATA_DIR, 'env');
   fs.mkdirSync(envDir, { recursive: true });
+  const allowedVars = [
+    'CLAUDE_CODE_OAUTH_TOKEN',
+    'ANTHROPIC_API_KEY',
+    'LLM_PROVIDER',
+    'LLM_MODEL',
+    'OPENAI_API_KEY',
+    'OPENAI_BASE_URL',
+    'OPENROUTER_API_KEY',
+    'OPENROUTER_BASE_URL',
+  ];
+  const envEntries = new Map<string, string>();
+
   const envFile = path.join(projectRoot, '.env');
   if (fs.existsSync(envFile)) {
     const envContent = fs.readFileSync(envFile, 'utf-8');
-    const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'];
-    const filteredLines = envContent.split('\n').filter((line) => {
+    for (const line of envContent.split('\n')) {
       const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('#')) return false;
-      return allowedVars.some((v) => trimmed.startsWith(`${v}=`));
-    });
-
-    if (filteredLines.length > 0) {
-      fs.writeFileSync(
-        path.join(envDir, 'env'),
-        filteredLines.join('\n') + '\n',
-      );
-      mounts.push({
-        hostPath: envDir,
-        containerPath: '/workspace/env-dir',
-        readonly: true,
-      });
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eq = trimmed.indexOf('=');
+      if (eq <= 0) continue;
+      const key = trimmed.slice(0, eq);
+      const value = trimmed.slice(eq + 1);
+      if (allowedVars.includes(key)) {
+        envEntries.set(key, value);
+      }
     }
+  }
+
+  for (const key of allowedVars) {
+    const value = process.env[key];
+    if (value !== undefined) {
+      envEntries.set(key, value);
+    }
+  }
+
+  if (envEntries.size > 0) {
+    const filteredLines = Array.from(envEntries.entries())
+      .map(([key, value]) => `${key}=${value}`);
+    fs.writeFileSync(
+      path.join(envDir, 'env'),
+      filteredLines.join('\n') + '\n',
+    );
+    mounts.push({
+      hostPath: envDir,
+      containerPath: '/workspace/env-dir',
+      readonly: true,
+    });
   }
 
   // Mount agent-runner source from host — recompiled on container startup.

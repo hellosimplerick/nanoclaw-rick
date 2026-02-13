@@ -72,6 +72,13 @@ function createSchema(database: Database.Database): void {
       container_config TEXT,
       requires_trigger INTEGER DEFAULT 1
     );
+    CREATE TABLE IF NOT EXISTS inbound_reply_deliveries (
+      inbound_message_id TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      sent_at TEXT,
+      last_error TEXT
+    );
   `);
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
@@ -81,6 +88,79 @@ function createSchema(database: Database.Database): void {
     );
   } catch {
     /* column already exists */
+  }
+
+  // Migrate inbound_reply_deliveries from old schema if present.
+  try {
+    database.exec(
+      `ALTER TABLE inbound_reply_deliveries ADD COLUMN status TEXT DEFAULT 'sent'`,
+    );
+  } catch {
+    /* column already exists */
+  }
+  try {
+    database.exec(
+      `ALTER TABLE inbound_reply_deliveries ADD COLUMN created_at TEXT`,
+    );
+  } catch {
+    /* column already exists */
+  }
+  try {
+    database.exec(
+      `ALTER TABLE inbound_reply_deliveries ADD COLUMN last_error TEXT`,
+    );
+  } catch {
+    /* column already exists */
+  }
+  try {
+    database.exec(
+      `
+      UPDATE inbound_reply_deliveries
+      SET
+        status = COALESCE(status, 'sent'),
+        created_at = COALESCE(created_at, sent_at, datetime('now'))
+      WHERE status IS NULL OR created_at IS NULL
+      `,
+    );
+  } catch {
+    /* best effort migration */
+  }
+
+  // If legacy schema still has sent_at NOT NULL, rebuild table to allow pending rows.
+  try {
+    const inboundCols = database
+      .prepare(`PRAGMA table_info(inbound_reply_deliveries)`)
+      .all() as Array<{ name: string; notnull: number }>;
+    const sentAtCol = inboundCols.find((c) => c.name === 'sent_at');
+    if (sentAtCol?.notnull === 1) {
+      database.exec(`
+        CREATE TABLE IF NOT EXISTS inbound_reply_deliveries_new (
+          inbound_message_id TEXT PRIMARY KEY,
+          status TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          sent_at TEXT,
+          last_error TEXT
+        );
+        INSERT OR REPLACE INTO inbound_reply_deliveries_new (
+          inbound_message_id,
+          status,
+          created_at,
+          sent_at,
+          last_error
+        )
+        SELECT
+          inbound_message_id,
+          COALESCE(status, 'sent') AS status,
+          COALESCE(created_at, sent_at, datetime('now')) AS created_at,
+          sent_at,
+          last_error
+        FROM inbound_reply_deliveries;
+        DROP TABLE inbound_reply_deliveries;
+        ALTER TABLE inbound_reply_deliveries_new RENAME TO inbound_reply_deliveries;
+      `);
+    }
+  } catch {
+    /* best effort migration */
   }
 }
 
@@ -274,6 +354,75 @@ export function getMessagesSince(
   return db
     .prepare(sql)
     .all(chatJid, sinceTimestamp, `${botPrefix}:%`) as NewMessage[];
+}
+
+/**
+ * Atomically claim outbound delivery work for one inbound message id.
+ * Returns true when this worker should perform the send.
+ */
+export function tryClaimInboundReply(
+  inboundMessageId: string,
+  staleSeconds = 60,
+): boolean {
+  const nowIso = new Date().toISOString();
+  const insertInfo = db.prepare(
+    `
+      INSERT OR IGNORE INTO inbound_reply_deliveries (
+        inbound_message_id,
+        status,
+        created_at
+      )
+      VALUES (?, 'pending', ?)
+    `,
+  ).run(inboundMessageId, nowIso);
+  if (insertInfo.changes > 0) return true;
+
+  const existing = db.prepare(
+    `
+      SELECT status, created_at
+      FROM inbound_reply_deliveries
+      WHERE inbound_message_id = ?
+    `,
+  ).get(inboundMessageId) as { status: string; created_at: string } | undefined;
+  if (!existing) return false;
+  if (existing.status === 'sent') return false;
+  if (existing.status !== 'pending') return false;
+
+  const createdMs = Date.parse(existing.created_at);
+  if (!Number.isFinite(createdMs)) return false;
+  if (Date.now() - createdMs < staleSeconds * 1000) return false;
+
+  const reclaimInfo = db.prepare(
+    `
+      UPDATE inbound_reply_deliveries
+      SET created_at = ?, last_error = NULL
+      WHERE inbound_message_id = ? AND status = 'pending'
+    `,
+  ).run(nowIso, inboundMessageId);
+  return reclaimInfo.changes > 0;
+}
+
+export function markInboundReplySent(inboundMessageId: string): void {
+  db.prepare(
+    `
+      UPDATE inbound_reply_deliveries
+      SET status = 'sent', sent_at = ?, last_error = NULL
+      WHERE inbound_message_id = ? AND status = 'pending'
+    `,
+  ).run(new Date().toISOString(), inboundMessageId);
+}
+
+export function markInboundReplyFailed(
+  inboundMessageId: string,
+  err: string,
+): void {
+  db.prepare(
+    `
+      UPDATE inbound_reply_deliveries
+      SET last_error = ?
+      WHERE inbound_message_id = ? AND status = 'pending'
+    `,
+  ).run(err, inboundMessageId);
 }
 
 export function createTask(

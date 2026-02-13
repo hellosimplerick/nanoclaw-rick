@@ -19,6 +19,7 @@ import path from 'path';
 import { HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 import { AnthropicProvider } from './llm/anthropic-provider.js';
+import { OpenAiProvider } from './llm/openai-provider.js';
 
 interface ContainerInput {
   prompt: string;
@@ -57,7 +58,10 @@ interface SDKUserMessage {
 const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
-const llmProvider = new AnthropicProvider();
+const llmProvider =
+  (process.env.LLM_PROVIDER || 'openai').toLowerCase() === 'openai'
+    ? new OpenAiProvider()
+    : new AnthropicProvider();
 
 /**
  * Push-based async iterable for streaming user messages to the SDK.
@@ -412,26 +416,50 @@ async function runQuery(
     }
   })) {
     messageCount++;
-    const msgType = message.type === 'system' ? `system/${(message as { subtype?: string }).subtype}` : message.type;
+    const systemSubtype =
+      message.type === 'system' && typeof message.subtype === 'string'
+        ? message.subtype
+        : undefined;
+    const msgType = message.type === 'system' ? `system/${systemSubtype}` : message.type;
     log(`[msg #${messageCount}] type=${msgType}`);
 
-    if (message.type === 'assistant' && 'uuid' in message) {
+    if (
+      message.type === 'assistant' &&
+      typeof (message as { uuid?: unknown }).uuid === 'string'
+    ) {
       lastAssistantUuid = (message as { uuid: string }).uuid;
     }
 
-    if (message.type === 'system' && message.subtype === 'init') {
+    if (
+      message.type === 'system' &&
+      message.subtype === 'init' &&
+      typeof message.session_id === 'string'
+    ) {
       newSessionId = message.session_id;
       log(`Session initialized: ${newSessionId}`);
     }
 
-    if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
-      const tn = message as { task_id: string; status: string; summary: string };
-      log(`Task notification: task=${tn.task_id} status=${tn.status} summary=${tn.summary}`);
+    if (message.type === 'system' && systemSubtype === 'task_notification') {
+      const tn = message as {
+        task_id?: unknown;
+        status?: unknown;
+        summary?: unknown;
+      };
+      if (
+        typeof tn.task_id === 'string' &&
+        typeof tn.status === 'string' &&
+        typeof tn.summary === 'string'
+      ) {
+        log(`Task notification: task=${tn.task_id} status=${tn.status} summary=${tn.summary}`);
+      }
     }
 
     if (message.type === 'result') {
       resultCount++;
-      const textResult = 'result' in message ? (message as { result?: string }).result : null;
+      const textResult =
+        typeof (message as { result?: unknown }).result === 'string'
+          ? (message as { result: string }).result
+          : null;
       log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
       writeOutput({
         status: 'success',
