@@ -372,7 +372,7 @@ export function tryClaimInboundReply(
         status,
         created_at
       )
-      VALUES (?, 'pending', ?)
+      VALUES (?, 'sending', ?)
     `,
   ).run(inboundMessageId, nowIso);
   if (insertInfo.changes > 0) return true;
@@ -386,20 +386,34 @@ export function tryClaimInboundReply(
   ).get(inboundMessageId) as { status: string; created_at: string } | undefined;
   if (!existing) return false;
   if (existing.status === 'sent') return false;
-  if (existing.status !== 'pending') return false;
 
   const createdMs = Date.parse(existing.created_at);
   if (!Number.isFinite(createdMs)) return false;
-  if (Date.now() - createdMs < staleSeconds * 1000) return false;
 
-  const reclaimInfo = db.prepare(
-    `
-      UPDATE inbound_reply_deliveries
-      SET created_at = ?, last_error = NULL
-      WHERE inbound_message_id = ? AND status = 'pending'
-    `,
-  ).run(nowIso, inboundMessageId);
-  return reclaimInfo.changes > 0;
+  if (existing.status === 'sending') {
+    if (Date.now() - createdMs < staleSeconds * 1000) return false;
+    const reclaimInfo = db.prepare(
+      `
+        UPDATE inbound_reply_deliveries
+        SET created_at = ?, status = 'sending', last_error = NULL
+        WHERE inbound_message_id = ? AND status = 'sending'
+      `,
+    ).run(nowIso, inboundMessageId);
+    return reclaimInfo.changes > 0;
+  }
+
+  if (existing.status === 'pending') {
+    const claimInfo = db.prepare(
+      `
+        UPDATE inbound_reply_deliveries
+        SET created_at = ?, status = 'sending', last_error = NULL
+        WHERE inbound_message_id = ? AND status = 'pending'
+      `,
+    ).run(nowIso, inboundMessageId);
+    return claimInfo.changes > 0;
+  }
+
+  return false;
 }
 
 export function markInboundReplySent(inboundMessageId: string): void {
@@ -407,7 +421,7 @@ export function markInboundReplySent(inboundMessageId: string): void {
     `
       UPDATE inbound_reply_deliveries
       SET status = 'sent', sent_at = ?, last_error = NULL
-      WHERE inbound_message_id = ? AND status = 'pending'
+      WHERE inbound_message_id = ? AND status = 'sending'
     `,
   ).run(new Date().toISOString(), inboundMessageId);
 }
@@ -419,10 +433,38 @@ export function markInboundReplyFailed(
   db.prepare(
     `
       UPDATE inbound_reply_deliveries
-      SET last_error = ?
-      WHERE inbound_message_id = ? AND status = 'pending'
+      SET status = 'pending', last_error = ?
+      WHERE inbound_message_id = ? AND status = 'sending'
     `,
   ).run(err, inboundMessageId);
+}
+
+export function resetStaleSendingReplies(staleSeconds = 300): number {
+  const staleSecondsClamped = Math.max(0, staleSeconds);
+  const rows = db.prepare(
+    `
+      SELECT inbound_message_id, created_at
+      FROM inbound_reply_deliveries
+      WHERE status = 'sending'
+    `,
+  ).all() as Array<{ inbound_message_id: string; created_at: string }>;
+
+  let updated = 0;
+  for (const row of rows) {
+    const createdMs = Date.parse(row.created_at);
+    if (!Number.isFinite(createdMs)) continue;
+    if (Date.now() - createdMs <= staleSecondsClamped * 1000) continue;
+    const info = db.prepare(
+      `
+        UPDATE inbound_reply_deliveries
+        SET status = 'pending', last_error = NULL
+        WHERE inbound_message_id = ? AND status = 'sending'
+      `,
+    ).run(row.inbound_message_id);
+    updated += info.changes;
+  }
+
+  return updated;
 }
 
 export function createTask(

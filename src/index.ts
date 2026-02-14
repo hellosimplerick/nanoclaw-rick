@@ -25,6 +25,7 @@ import {
   getNewMessages,
   getRouterState,
   initDatabase,
+  resetStaleSendingReplies,
   setRegisteredGroup,
   setRouterState,
   setSession,
@@ -215,14 +216,33 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
       if (text) {
         for (const inboundMessageId of deliveryInboundMessageIds) {
-          if (!tryClaimInboundReply(inboundMessageId)) continue;
+          const claimed = tryClaimInboundReply(inboundMessageId);
+          if (!claimed) {
+            logger.info(
+              { group: group.name, chatJid, inboundMessageId },
+              'Send skipped (already sent)',
+            );
+            continue;
+          }
+          logger.info(
+            { group: group.name, chatJid, inboundMessageId },
+            'Claimed inbound reply',
+          );
           try {
             await dispatchOutboundMessage(chatJid, `${ASSISTANT_NAME}: ${text}`);
             markInboundReplySent(inboundMessageId);
             outputSentToUser = true;
+            logger.info(
+              { group: group.name, chatJid, inboundMessageId },
+              'Send success',
+            );
           } catch (err) {
             const errorMessage = err instanceof Error ? err.message : String(err);
             markInboundReplyFailed(inboundMessageId, errorMessage);
+            logger.error(
+              { group: group.name, chatJid, inboundMessageId, errorMessage },
+              'Send failure',
+            );
             throw err;
           }
         }
@@ -528,6 +548,14 @@ async function main(): Promise<void> {
   logger.info(`Container runtime selected: ${containerEngine}`);
   ensureContainerSystemRunning();
   initDatabase();
+  const staleSeconds = 300;
+  const recoveredStaleCount = resetStaleSendingReplies(staleSeconds);
+  if (recoveredStaleCount > 0) {
+    logger.info(
+      { count: recoveredStaleCount, staleSeconds },
+      'Recovered stale sending replies',
+    );
+  }
   logger.info('Database initialized');
   loadState();
 

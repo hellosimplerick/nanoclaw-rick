@@ -532,9 +532,6 @@ async function main(): Promise<void> {
         break;
       }
 
-      // Emit session update so host can track it
-      writeOutput({ status: 'success', result: null, newSessionId: sessionId });
-
       log('Query ended, waiting for next IPC message...');
 
       // Wait for the next message or _close sentinel

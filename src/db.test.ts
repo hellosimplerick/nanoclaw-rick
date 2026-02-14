@@ -8,8 +8,11 @@ import {
   getMessagesSince,
   getNewMessages,
   getTaskById,
+  markInboundReplySent,
+  resetStaleSendingReplies,
   storeChatMetadata,
   storeMessage,
+  tryClaimInboundReply,
   updateTask,
 } from './db.js';
 
@@ -311,5 +314,22 @@ describe('task CRUD', () => {
 
     deleteTask('task-3');
     expect(getTaskById('task-3')).toBeUndefined();
+  });
+});
+
+describe('inbound reply delivery lifecycle', () => {
+  it('claims once while sending, then becomes unclaimable after sent', () => {
+    expect(tryClaimInboundReply('inbound-1')).toBe(true);
+    expect(tryClaimInboundReply('inbound-1')).toBe(false);
+
+    markInboundReplySent('inbound-1');
+    expect(tryClaimInboundReply('inbound-1')).toBe(false);
+  });
+
+  it('resets stale sending rows back to pending', () => {
+    expect(tryClaimInboundReply('inbound-stale')).toBe(true);
+    expect(tryClaimInboundReply('inbound-stale')).toBe(false);
+    expect(resetStaleSendingReplies(0)).toBe(1);
+    expect(tryClaimInboundReply('inbound-stale')).toBe(true);
   });
 });
