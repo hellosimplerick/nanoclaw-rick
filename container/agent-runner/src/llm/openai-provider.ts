@@ -70,6 +70,15 @@ export class OpenAiProvider implements LlmProvider {
     }
 
     const resultText = parsed?.choices?.[0]?.message?.content?.trim();
+
+    // If the provider returned no content, dump a safe slice of the raw body for diagnosis.
+    if (!resultText) {
+      const safeSlice = bodyText.slice(0, 1200);
+      console.error(
+        `[openai-provider] Empty content. status=${response.status} model=${model} endpoint=${endpoint} body=${safeSlice}`,
+      );
+    }
+
     yield {
       type: 'result',
       subtype: 'success',
