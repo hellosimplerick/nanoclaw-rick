@@ -28,13 +28,36 @@ function safeEnvSnapshot() {
   return rows;
 }
 
+function isDebugMode(): boolean {
+  return process.argv.includes('--debug') || process.env.CHUCK_DEBUG === '1';
+}
+
+function shouldShowLine(line: string): boolean {
+  // Normal mode filtering rules:
+  // - Drop DEBUG
+  // - Keep INFO/WARN/ERROR and key lifecycle lines
+  if (line.includes('DEBUG')) return false;
+
+  return (
+    line.includes('INFO') ||
+    line.includes('WARN') ||
+    line.includes('ERROR') ||
+    line.includes('NanoClaw running') ||
+    line.includes('Shutdown signal received') ||
+    line.includes('Send success') ||
+    line.includes('Send failed')
+  );
+}
+
 async function main() {
-  // Minimal TUI stub (no extra deps): just a prompt loop.
-  // Future: replace with a real TUI library once behavior is stable.
+  const debug = isDebugMode();
+
   process.stdout.write('\n');
   process.stdout.write('╔══════════════════════════════════╗\n');
   process.stdout.write('║              CHUCK               ║\n');
   process.stdout.write('╚══════════════════════════════════╝\n\n');
+
+  process.stdout.write(`Mode: ${debug ? 'debug' : 'normal'}\n\n`);
 
   process.stdout.write('Config (non-secret):\n');
   for (const line of safeEnvSnapshot()) process.stdout.write(`  - ${line}\n`);
@@ -49,7 +72,6 @@ async function main() {
     if (trimmed === 'q' || trimmed === 'quit' || trimmed === 'exit') {
       rl.close();
       process.exit(0);
-      return;
     }
 
     // Start the existing compiled entrypoint.
@@ -58,22 +80,47 @@ async function main() {
     const env = { ...process.env };
     if (!env.ASSISTANT_NAME) env.ASSISTANT_NAME = 'Chuck';
 
-    const child = spawn('node', ['dist/index.js'], {
-      stdio: 'inherit',
-      env,
-    });
+    // Spawn NanoClaw host:
+    // - debug: inherit everything (full firehose)
+    // - normal: keep stdin interactive, but filter stdout/stderr
+    let child: ReturnType<typeof spawn>;
 
-    child.on('exit', (code, signal) => {
-      if (signal) {
-        process.exit(1);
-      }
+    if (debug) {
+      child = spawn('node', ['dist/index.js'], {
+        stdio: 'inherit',
+        env,
+      });
+    } else {
+      // Node typings dislike readonly tuples here; use a mutable array.
+      const stdio: any = ['inherit', 'pipe', 'pipe'];
+
+      child = spawn('node', ['dist/index.js'], {
+        stdio,
+        env,
+      });
+
+      const filterWrite = (data: Buffer) => {
+        const text = data.toString();
+        const lines = text.split('\n');
+
+        for (const ln of lines) {
+          if (!ln.trim()) continue;
+          if (shouldShowLine(ln)) process.stdout.write(ln + '\n');
+        }
+      };
+
+      if (child.stdout) child.stdout.on('data', filterWrite);
+      if (child.stderr) child.stderr.on('data', filterWrite);
+    }
+
+    child.on('exit', (code: number | null, signal: NodeJS.Signals | null) => {
+      if (signal) process.exit(1);
       process.exit(code ?? 0);
     });
   });
 }
 
 main().catch((err) => {
-  // Keep it blunt; no stack spam unless LOG_LEVEL is debug.
   console.error('[chuck] Failed to start:', err?.message ?? err);
   process.exit(1);
 });
