@@ -1,5 +1,8 @@
 import fs from 'fs';
 import path from 'path';
+import { braveSearch, formatSearchResultsBlock } from './search/brave.js';
+import { fetchRepoForks, formatForkResults } from './search/github.js';
+
 
 import {
   ASSISTANT_NAME,
@@ -177,9 +180,62 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (!hasTrigger) return true;
   }
 
-  const prompt = formatMessages(missedMessages);
-  const deliveryInboundMessageIds = missedMessages.map((m) => m.id);
+  // Detect /search at beginning of latest message (explicit trigger only)
+  const latest = missedMessages[missedMessages.length - 1];
+  const trimmed = latest.content.trim();
 
+  let searchQuery: string | null = null;
+  let messagesForPrompt = missedMessages;
+
+  if (trimmed.startsWith('/search ')) {
+    const q = trimmed.slice('/search '.length).trim();
+    if (q.length > 0) {
+      searchQuery = q;
+
+      // Replace latest message content so the model doesn't see the /search command
+      messagesForPrompt = missedMessages.map((m, i) =>
+        i === missedMessages.length - 1 ? { ...m, content: q } : m,
+      );
+    }
+  }
+
+  let prompt = formatMessages(messagesForPrompt);
+
+  if (searchQuery) {
+    // Hybrid router: GitHub forks (structured) vs Brave (web)
+    const m = searchQuery.match(/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)/);
+    const wantsForks = /\bforks?\b/i.test(searchQuery);
+
+    let block = '';
+
+    if (m && wantsForks) {
+      const owner = m[1];
+      const repo = m[2];
+      const forks = await fetchRepoForks(owner, repo);
+      block = formatForkResults(owner, repo, forks);
+    } else {
+      const results = await braveSearch(searchQuery);
+      block = formatSearchResultsBlock(searchQuery, results);
+    }
+
+    prompt =
+      `You are in SEARCH MODE.\n` +
+      `Use ONLY the provided search results to answer.\n` +
+      `If the answer is not contained in the results, say: "No relevant results found."\n` +
+      `Do NOT fabricate repositories, forks, or URLs.\n` +
+      `Cite URLs exactly as given.\n` +
+      `---\n` +
+      block +
+      prompt;
+
+    logger.info(
+      { group: group.name },
+      `Search-injected prompt prefix: ${prompt.slice(0, 300).replace(/\n/g, '\\n')}`,
+    );
+  }
+
+
+  const deliveryInboundMessageIds = missedMessages.map((m) => m.id);
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
   const previousCursor = lastAgentTimestamp[chatJid] || '';
@@ -313,12 +369,12 @@ async function runAgent(
   // Wrap onOutput to track session ID from streamed results
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
-        if (output.newSessionId) {
-          sessions[group.folder] = output.newSessionId;
-          setSession(group.folder, output.newSessionId);
-        }
-        await onOutput(output);
+      if (output.newSessionId) {
+        sessions[group.folder] = output.newSessionId;
+        setSession(group.folder, output.newSessionId);
       }
+      await onOutput(output);
+    }
     : undefined;
 
   try {
