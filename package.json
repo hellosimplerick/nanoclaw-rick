@@ -7,6 +7,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
+    "chuck": "tsx src/chuck.ts",
     "dev": "tsx src/index.ts",
     "auth": "tsx src/whatsapp-auth.ts",
     "typecheck": "tsc --noEmit",
@@ -19,7 +20,7 @@
     "@whiskeysockets/baileys": "^7.0.0-rc.9",
     "better-sqlite3": "^11.8.1",
     "cron-parser": "^5.5.0",
-"pino": "^9.6.0",
+    "pino": "^9.6.0",
     "pino-pretty": "^13.0.0",
     "qrcode-terminal": "^0.12.0",
     "zod": "^4.3.6"
@@ -36,5 +37,8 @@
   },
   "engines": {
     "node": ">=20"
+  },
+  "bin": {
+    "chuck": "bin/chuck"
   }
 }
